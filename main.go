@@ -1,4 +1,4 @@
-// kwall - Kitty Wallpaper Switcher for macOS.
+// kwall - Kitty Wallpaper Switcher for macOS and Linux (Wayland/Hyprland).
 package main
 
 import (
@@ -11,6 +11,7 @@ import (
 	"kwall/internal/config"
 	"kwall/internal/fzf"
 	"kwall/internal/preview"
+	"kwall/internal/pywal"
 	"kwall/internal/wallpaper"
 )
 
@@ -18,7 +19,7 @@ var version = "dev"
 
 const cacheWorkers = 8
 
-const usage = `kwall - switch macOS wallpapers from the Kitty terminal
+const usage = `kwall - switch wallpapers from the Kitty terminal (macOS and Linux)
 
 Usage:
   kwall                  pick a wallpaper with fzf and a live image preview
@@ -30,8 +31,12 @@ Usage:
 
 Environment:
   WALLPAPER_DIR          wallpaper directory (default ~/Pictures/Wallpapers)
-  KWALL_BACKEND          "plist" (default on macOS 14+, updates every Space),
-                         "osascript" or "wallpaper" (active Space only)
+  KWALL_BACKEND          "plist" (macOS 14+ default, updates every Space),
+                         "osascript" (macOS 13 and earlier), "awww" (Linux default),
+                         or "wallpaper" (active Space only)
+  KWALL_AWWW_ARGS        extra flags for "awww img", e.g. "--resize fit --outputs DP-1"
+  KWALL_PYWAL=1          run pywal after each change (colours follow the wallpaper)
+  KWALL_PYWAL_ARGS       extra flags for wal, e.g. "-a 85 --backend colorz"
   KWALL_UNICODE_PLACEHOLDER=0   disable kitty's unicode placeholder mode in previews
 
 Post-hook: an executable ~/.config/kwall/post-hook.sh is run after each change
@@ -99,10 +104,10 @@ func listImages(cfg *config.Config) ([]string, error) {
 }
 
 func apply(cfg *config.Config, abs string) error {
-	// Hand the hook a small cached thumbnail too (usually already cached by
-	// the preview), so image-analysis tools like pywal run fast.
+	// Hand pywal and the hook a small cached thumbnail (usually already
+	// cached by the preview), so image analysis runs fast.
 	thumb := ""
-	if wallpaper.HasHook(cfg) {
+	if pywal.Enabled() || wallpaper.HasHook(cfg) {
 		if t, _, err := preview.EnsureThumb(cfg, abs); err == nil {
 			thumb = t
 		}
@@ -176,6 +181,9 @@ func cmdCurrent(cfg *config.Config) error {
 }
 
 func cmdCache(cfg *config.Config) error {
+	if !preview.HasThumbnailer() {
+		return preview.ErrNoThumbnailer
+	}
 	files, err := listImages(cfg)
 	if err != nil {
 		return err

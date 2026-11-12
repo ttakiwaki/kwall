@@ -2,9 +2,11 @@ package preview
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,6 +39,64 @@ func installFakeSips(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// installOnlyTools makes PATH contain nothing but stub tools that write their
+// own name into the output file (the last argument), so the test is hermetic
+// on any OS regardless of what is really installed.
+func installOnlyTools(t *testing.T, names ...string) {
+	t.Helper()
+	bin := t.TempDir()
+	for _, n := range names {
+		script := "#!/bin/sh\nfor last; do :; done\necho " + n + " > \"$last\"\n"
+		if err := os.WriteFile(filepath.Join(bin, n), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin)
+}
+
+func TestThumbToolSelection(t *testing.T) {
+	cases := []struct {
+		tools []string
+		want  string
+	}{
+		{[]string{"sips", "magick", "ffmpeg"}, "sips"},
+		{[]string{"magick", "convert", "ffmpeg"}, "magick"},
+		{[]string{"convert", "ffmpeg"}, "convert"},
+		{[]string{"ffmpeg"}, "ffmpeg"},
+	}
+	for _, c := range cases {
+		installOnlyTools(t, c.tools...)
+		cfg, img := newTestConfig(t)
+		thumb, _, err := EnsureThumb(cfg, img)
+		if err != nil {
+			t.Fatalf("%v: %v", c.tools, err)
+		}
+		b, _ := os.ReadFile(thumb)
+		if got := strings.TrimSpace(string(b)); got != c.want {
+			t.Errorf("tools %v: used %q, want %q", c.tools, got, c.want)
+		}
+	}
+}
+
+func TestNoThumbnailer(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	if HasThumbnailer() {
+		t.Fatal("HasThumbnailer should be false")
+	}
+	cfg, img := newTestConfig(t)
+	if _, _, err := EnsureThumb(cfg, img); !errors.Is(err, ErrNoThumbnailer) {
+		t.Fatalf("got %v, want ErrNoThumbnailer", err)
+	}
+}
+
+func TestImageMagickArgs(t *testing.T) {
+	got := imageMagickArgs("/in.heic", "/out.jpg")
+	want := []string{"/in.heic[0]", "-auto-orient", "-resize", "1000x1000>", "-quality", "85", "/out.jpg"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
 }
 
 func newTestConfig(t *testing.T) (*config.Config, string) {

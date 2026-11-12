@@ -1,10 +1,11 @@
 // Package preview renders wallpaper previews with kitten icat and manages
-// the sips-generated thumbnail cache.
+// the thumbnail cache (generated with sips, ImageMagick or ffmpeg).
 package preview
 
 import (
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -20,6 +21,51 @@ import (
 const ThumbSize = "1000"
 
 var tmpCounter atomic.Uint64
+
+// ErrNoThumbnailer means no image tool for making thumbnails is installed.
+var ErrNoThumbnailer = errors.New("no thumbnail tool found (macOS has sips built in; on Linux install ImageMagick or ffmpeg)")
+
+type thumbTool struct {
+	name string
+	args func(in, out string) []string
+}
+
+// thumbTools are tried in order; the first one found in PATH is used. sips
+// ships with macOS; ImageMagick (v7 `magick`, v6 `convert`) and ffmpeg are the
+// usual choices on Linux.
+var thumbTools = []thumbTool{
+	{"sips", func(in, out string) []string {
+		return []string{"-s", "format", "jpeg", "-Z", ThumbSize, in, "--out", out}
+	}},
+	{"magick", imageMagickArgs},
+	{"convert", imageMagickArgs},
+	{"ffmpeg", func(in, out string) []string {
+		return []string{"-v", "error", "-y", "-i", in,
+			"-vf", "scale=w=" + ThumbSize + ":h=" + ThumbSize + ":force_original_aspect_ratio=decrease",
+			"-frames:v", "1", "-update", "1", out}
+	}},
+}
+
+// imageMagickArgs downscales (never upscales) to ThumbSize and keeps only the
+// first frame of animated inputs.
+func imageMagickArgs(in, out string) []string {
+	return []string{in + "[0]", "-auto-orient", "-resize", ThumbSize + "x" + ThumbSize + ">", "-quality", "85", out}
+}
+
+func findThumbTool() (string, thumbTool, bool) {
+	for _, t := range thumbTools {
+		if p, err := exec.LookPath(t.name); err == nil {
+			return p, t, true
+		}
+	}
+	return "", thumbTool{}, false
+}
+
+// HasThumbnailer reports whether a tool for generating thumbnails exists.
+func HasThumbnailer() bool {
+	_, _, ok := findThumbTool()
+	return ok
+}
 
 // InKitty reports whether we are running inside a Kitty window.
 func InKitty() bool {
@@ -52,13 +98,19 @@ func EnsureThumb(cfg *config.Config, abs string) (thumb string, created bool, er
 		return "", false, err
 	}
 
+	bin, tool, ok := findThumbTool()
+	if !ok {
+		return "", false, ErrNoThumbnailer
+	}
+
 	// Write to a temp name then rename, so a concurrent reader never sees a
-	// half-written thumbnail.
-	tmp := fmt.Sprintf("%s.tmp-%d-%d", thumb, os.Getpid(), tmpCounter.Add(1))
-	out, err := exec.Command("sips", "-s", "format", "jpeg", "-Z", ThumbSize, abs, "--out", tmp).CombinedOutput()
+	// half-written thumbnail. The name keeps a .jpg extension because
+	// ImageMagick and ffmpeg pick the output format from it.
+	tmp := fmt.Sprintf("%s.tmp-%d-%d.jpg", strings.TrimSuffix(thumb, ".jpg"), os.Getpid(), tmpCounter.Add(1))
+	out, err := exec.Command(bin, tool.args(abs, tmp)...).CombinedOutput()
 	if err != nil {
 		os.Remove(tmp)
-		return "", false, fmt.Errorf("sips failed: %v: %s", err, strings.TrimSpace(string(out)))
+		return "", false, fmt.Errorf("%s failed: %v: %s", tool.name, err, strings.TrimSpace(string(out)))
 	}
 	if err := os.Rename(tmp, thumb); err != nil {
 		os.Remove(tmp)
@@ -87,10 +139,10 @@ func IcatArgs(img, cols, lines string, placeholder bool) []string {
 func Render(cfg *config.Config, rel string) error {
 	abs := cfg.ResolveRel(rel)
 	img := abs
-	if thumb, _, err := EnsureThumb(cfg, abs); err != nil {
-		fmt.Fprintf(os.Stderr, "kwall: thumbnail failed, using original: %v\n", err)
-	} else {
+	if thumb, _, err := EnsureThumb(cfg, abs); err == nil {
 		img = thumb
+	} else if !errors.Is(err, ErrNoThumbnailer) {
+		fmt.Fprintf(os.Stderr, "kwall: thumbnail failed, using original: %v\n", err)
 	}
 
 	// Set KWALL_UNICODE_PLACEHOLDER=0 to fall back to kitty's direct
