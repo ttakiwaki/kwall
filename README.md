@@ -5,7 +5,7 @@ and a live, high-resolution image preview rendered by `kitten icat`.
 
 ## Requirements
 
-- macOS (uses `sips` and `osascript`)
+- macOS (uses `sips`, `plutil`, and `osascript` on macOS 13 and earlier)
 - [Kitty](https://sw.kovidgoyal.net/kitty/) terminal (for previews)
 - `fzf` (`brew install fzf`)
 - Go 1.22+ to build
@@ -53,14 +53,15 @@ wal -n -q -e -a 85 -i "${2:-$1}"
 
 Other environment variables:
 
-- `KWALL_BACKEND=wallpaper` uses the [`wallpaper` CLI](https://github.com/sindresorhus/macos-wallpaper) instead of `osascript`.
+- `KWALL_BACKEND` controls how wallpapers are applied:
+  - `plist` (default on macOS 14+): updates `~/Library/Application Support/com.apple.wallpaper/Store/Index.plist` and restarts `WallpaperAgent` so the wallpaper changes across **every macOS Space** and display (falls back to `osascript` on macOS 13 and earlier).
+  - `osascript`: uses System Events AppleScript (active Space only).
+  - `wallpaper`: uses the [`wallpaper` CLI](https://github.com/sindresorhus/macos-wallpaper) (active Space only).
 - `KWALL_UNICODE_PLACEHOLDER=0` turns off Kitty's Unicode placeholder mode in the preview pane (falls back to direct placement) if previews misrender in your fzf/Kitty combination.
 
 ## First run
 
-The first time you set a wallpaper, macOS will ask whether your terminal may
-control **System Events**. Allow it (System Settings > Privacy & Security >
-Automation). Run `kwall cache` once so the first scroll through the picker is instant.
+On macOS 14+, the default `plist` backend needs no special Automation permission. If you use `KWALL_BACKEND=osascript` (or macOS 13 and earlier), macOS will ask whether your terminal may control **System Events** — allow it in System Settings > Privacy & Security > Automation. Run `kwall cache` once so the first scroll through the picker is instant.
 
 ## Layout
 
@@ -69,5 +70,5 @@ main.go                     CLI dispatch
 internal/config/            env vars, XDG paths, image discovery
 internal/fzf/               spawns fzf with --preview="kwall preview {}"
 internal/preview/           kitten icat + sips thumbnail cache
-internal/wallpaper/         osascript wallpaper setter, state file, post-hook
+internal/wallpaper/         wallpaper store/osascript setter, state file, post-hook
 ```

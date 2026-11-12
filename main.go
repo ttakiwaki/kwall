@@ -30,7 +30,8 @@ Usage:
 
 Environment:
   WALLPAPER_DIR          wallpaper directory (default ~/Pictures/Wallpapers)
-  KWALL_BACKEND          "wallpaper" to use the wallpaper CLI instead of osascript
+  KWALL_BACKEND          "plist" (default on macOS 14+, updates every Space),
+                         "osascript" or "wallpaper" (active Space only)
   KWALL_UNICODE_PLACEHOLDER=0   disable kitty's unicode placeholder mode in previews
 
 Post-hook: an executable ~/.config/kwall/post-hook.sh is run after each change
