@@ -112,3 +112,92 @@ func TestResolveInput(t *testing.T) {
 		t.Error("expected error for missing file")
 	}
 }
+
+func TestLoadTOMLAndPrecedence(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("XDG_CACHE_HOME", "")
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("WALLPAPER_DIR", "")
+	t.Setenv("KWALL_BACKEND", "")
+	t.Setenv("KWALL_COLORS", "")
+	t.Setenv("KWALL_PYWAL", "")
+
+	tomlPath := filepath.Join(home, ".config", "kwall", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(tomlPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := `
+[wallpaper]
+dir = "~/toml-walls"
+backend = "macos"
+
+[colors]
+enabled = false
+mode = "light"
+saturation = 1.25
+contrast = 1.15
+alpha = 85
+
+[templates]
+enabled = ["kitty", "waybar", "hyprland"]
+
+[reload]
+kitty = false
+post_hook = "~/my-hook.sh"
+
+[cache]
+thumb_size = 256
+auto_prune = false
+`
+	if err := os.WriteFile(tomlPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WallpaperDir != filepath.Join(home, "toml-walls") {
+		t.Errorf("WallpaperDir = %q", cfg.WallpaperDir)
+	}
+	if cfg.Backend != "macos" {
+		t.Errorf("Backend = %q", cfg.Backend)
+	}
+	if cfg.Colors.Enabled != false || cfg.Colors.Mode != "light" || cfg.Colors.Saturation != 1.25 || cfg.Colors.Contrast != 1.15 || cfg.Colors.Alpha != 85 {
+		t.Errorf("Colors = %+v", cfg.Colors)
+	}
+	if want := []string{"kitty", "waybar", "hyprland"}; !reflect.DeepEqual(cfg.Templates.Enabled, want) {
+		t.Errorf("Templates.Enabled = %v, want %v", cfg.Templates.Enabled, want)
+	}
+	if cfg.Reload.Kitty != false || cfg.Reload.PostHook != filepath.Join(home, "my-hook.sh") {
+		t.Errorf("Reload = %+v", cfg.Reload)
+	}
+	if cfg.Cache.ThumbSize != 256 || cfg.Cache.AutoPrune != false {
+		t.Errorf("Cache = %+v", cfg.Cache)
+	}
+
+	// Env vars must override config.toml.
+	t.Setenv("WALLPAPER_DIR", "~/env-walls")
+	t.Setenv("KWALL_BACKEND", "awww")
+	t.Setenv("KWALL_COLORS", "1")
+	t.Setenv("KWALL_THUMB_SIZE", "512")
+
+	cfg2, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg2.WallpaperDir != filepath.Join(home, "env-walls") {
+		t.Errorf("env override WallpaperDir = %q", cfg2.WallpaperDir)
+	}
+	if cfg2.Backend != "awww" {
+		t.Errorf("env override Backend = %q", cfg2.Backend)
+	}
+	if !cfg2.Colors.Enabled {
+		t.Errorf("env override Colors.Enabled = false")
+	}
+	if cfg2.Cache.ThumbSize != 512 {
+		t.Errorf("env override ThumbSize = %d", cfg2.Cache.ThumbSize)
+	}
+}

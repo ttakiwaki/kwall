@@ -1,6 +1,7 @@
 package wallpaper
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -9,6 +10,8 @@ import (
 	"syscall"
 	"time"
 )
+
+const awwwCmdTimeout = 10 * time.Second
 
 // daemonWait is how long we wait for a freshly started awww-daemon to
 // accept commands. A variable so tests can shorten it.
@@ -28,7 +31,11 @@ func awwwBinaries() (cli, daemon string, err error) {
 // ensureDaemon makes sure awww-daemon is accepting commands, starting it in
 // the background if it is not running yet.
 func ensureDaemon(cli, daemon string) error {
-	running := func() bool { return exec.Command(cli, "query").Run() == nil }
+	running := func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		return exec.CommandContext(ctx, cli, "query").Run() == nil
+	}
 	if running() {
 		return nil
 	}
@@ -72,7 +79,9 @@ func setAwww(abs string) error {
 	}
 	args := append([]string{"img"}, strings.Fields(os.Getenv("KWALL_AWWW_ARGS"))...)
 	args = append(args, abs)
-	if out, err := exec.Command(cli, args...).CombinedOutput(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), awwwCmdTimeout)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, cli, args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("%s img failed: %v: %s", cli, err, strings.TrimSpace(string(out)))
 	}
 	return nil

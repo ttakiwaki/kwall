@@ -171,3 +171,41 @@ func TestWarmCache(t *testing.T) {
 		t.Fatalf("second run should be all cached: %+v", st)
 	}
 }
+
+func TestPruneCacheAndCustomThumbSize(t *testing.T) {
+	installFakeSips(t)
+	cfg, img := newTestConfig(t)
+	p1000, err := ThumbPath(cfg, img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Cache.ThumbSize = 256
+	p256, err := ThumbPath(cfg, img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p1000 == p256 {
+		t.Fatal("thumb path should vary with custom ThumbSize")
+	}
+
+	if _, _, err := EnsureThumb(cfg, img); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(cfg.ThumbDir, "deadbeef.jpg")
+	if err := os.WriteFile(stale, []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := PruneCache(cfg, []string{"a.jpg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale thumbnail was not pruned")
+	}
+	if _, err := os.Stat(p256); err != nil {
+		t.Fatalf("active thumbnail was pruned: %v", err)
+	}
+}

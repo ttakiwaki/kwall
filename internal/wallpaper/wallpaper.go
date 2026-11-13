@@ -1,8 +1,9 @@
 // Package wallpaper applies a wallpaper (macOS or Linux/Wayland), records
-// what was set and runs the pywal integration and the optional post-hook.
+// what was set, extracts/applies native colors, and runs the optional post-hook.
 package wallpaper
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -10,29 +11,49 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
+	"kwall/internal/colors"
 	"kwall/internal/config"
-	"kwall/internal/pywal"
 )
 
-// backend picks the wallpaper setter: $KWALL_BACKEND if set, otherwise the
-// default for this OS (plist on macOS, awww on Linux).
-func backend() string {
-	if b := strings.ToLower(strings.TrimSpace(os.Getenv("KWALL_BACKEND"))); b != "" {
+const hookTimeout = 15 * time.Second
+
+// backend picks the wallpaper setter: $KWALL_BACKEND if set, then cfgBackend,
+// otherwise the default for this OS (plist on macOS, awww on Linux).
+func backend(cfgBackend string) string {
+	b := strings.ToLower(strings.TrimSpace(os.Getenv("KWALL_BACKEND")))
+	if b == "" {
+		b = strings.ToLower(strings.TrimSpace(cfgBackend))
+	}
+	switch b {
+	case "", "auto":
+		switch runtime.GOOS {
+		case "darwin":
+			return "plist"
+		case "linux":
+			return "awww"
+		}
+		return ""
+	case "macos":
+		return "plist"
+	default:
 		return b
 	}
-	switch runtime.GOOS {
-	case "darwin":
-		return "plist"
-	case "linux":
-		return "awww"
-	}
-	return ""
 }
 
-// Set changes the wallpaper using the selected backend.
+// Set changes the wallpaper using the environment or OS default backend.
 func Set(abs string) error {
-	switch b := backend(); b {
+	return SetWithConfig(nil, abs)
+}
+
+// SetWithConfig changes the wallpaper using cfg's backend (overridden by $KWALL_BACKEND).
+func SetWithConfig(cfg *config.Config, abs string) error {
+	cfgBackend := ""
+	if cfg != nil {
+		cfgBackend = cfg.Backend
+	}
+	switch b := backend(cfgBackend); b {
 	case "plist":
 		return setPlist(abs)
 	case "osascript":
@@ -48,28 +69,33 @@ func Set(abs string) error {
 	}
 }
 
-// Apply sets the wallpaper, records it as the current one, runs pywal when
-// enabled and then the optional post-hook. thumb is a small cached JPEG of
-// the wallpaper ("" if none). Only a failure to set the wallpaper is fatal.
-func Apply(cfg *config.Config, abs, thumb string) error {
-	if err := Set(abs); err != nil {
-		return err
-	}
+// Finish saves the current wallpaper state, extracts & renders native colors
+// when enabled, and runs the optional post-hook.
+func Finish(cfg *config.Config, abs, thumb string) {
 	if err := WriteCurrent(cfg, abs); err != nil {
 		fmt.Fprintf(os.Stderr, "kwall: warning: could not save state: %v\n", err)
 	}
-	if pywal.Enabled() {
+	if cfg.Colors.Enabled {
 		img := abs
 		if thumb != "" {
 			img = thumb
 		}
-		if err := pywal.Run(cfg, img); err != nil {
-			fmt.Fprintf(os.Stderr, "kwall: warning: pywal: %v\n", err)
+		if err := colors.Run(cfg, img, abs); err != nil {
+			fmt.Fprintf(os.Stderr, "kwall: warning: colors: %v\n", err)
 		}
 	}
 	if err := RunHook(cfg, abs, thumb); err != nil {
 		fmt.Fprintf(os.Stderr, "kwall: warning: post-hook: %v\n", err)
 	}
+}
+
+// Apply sets the wallpaper, records it as the current one, generates colors
+// when enabled, and runs the optional post-hook.
+func Apply(cfg *config.Config, abs, thumb string) error {
+	if err := SetWithConfig(cfg, abs); err != nil {
+		return err
+	}
+	Finish(cfg, abs, thumb)
 	return nil
 }
 
@@ -95,6 +121,12 @@ func ReadCurrent(cfg *config.Config) (string, error) {
 
 // hookPath returns the post-hook script if one exists.
 func hookPath(cfg *config.Config) string {
+	if cfg.Reload.PostHook != "" {
+		if fi, err := os.Stat(cfg.Reload.PostHook); err == nil && !fi.IsDir() {
+			return cfg.Reload.PostHook
+		}
+		return ""
+	}
 	for _, name := range []string{"post-hook.sh", "post-hook"} {
 		p := filepath.Join(cfg.ConfigDir, name)
 		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
@@ -109,11 +141,9 @@ func HasHook(cfg *config.Config) bool {
 	return hookPath(cfg) != ""
 }
 
-// RunHook runs ~/.config/kwall/post-hook.sh (or post-hook) with the new
-// wallpaper path as $1 (also in $KWALL_WALLPAPER). If thumb is non-empty it
-// is a small cached JPEG of the wallpaper, passed as $2 (also in
-// $KWALL_THUMBNAIL); tools that analyse the image run much faster on it than
-// on a full-size 4K/5K original.
+// RunHook runs the configured post-hook script (or ~/.config/kwall/post-hook.sh)
+// with the new wallpaper path as $1 ($KWALL_WALLPAPER) and the cached thumbnail
+// as $2 ($KWALL_THUMBNAIL) if non-empty.
 func RunHook(cfg *config.Config, abs, thumb string) error {
 	p := hookPath(cfg)
 	if p == "" {
@@ -128,11 +158,16 @@ func RunHook(cfg *config.Config, abs, thumb string) error {
 		args = append(args, thumb)
 		env = append(env, "KWALL_THUMBNAIL="+thumb)
 	}
-	cmd := exec.Command(p, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), hookTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, p, args...)
 	cmd.Env = env
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("%s timed out after %s", p, hookTimeout)
+		}
 		return fmt.Errorf("%s: %w", p, err)
 	}
 	return nil

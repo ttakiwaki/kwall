@@ -11,7 +11,6 @@ import (
 	"kwall/internal/config"
 	"kwall/internal/fzf"
 	"kwall/internal/preview"
-	"kwall/internal/pywal"
 	"kwall/internal/wallpaper"
 )
 
@@ -26,17 +25,21 @@ Usage:
   kwall set <path>       set a specific image as the wallpaper
   kwall random           set a random wallpaper from the wallpaper directory
   kwall current          show the current wallpaper path (and preview in Kitty)
-  kwall cache            pre-generate thumbnails for the whole directory
+  kwall cache [--prune]  pre-generate thumbnails (and prune stale entries)
   kwall version          print the version
+
+Configuration:
+  Optional ~/.config/kwall/config.toml (CLI flags > env vars > config.toml > defaults).
 
 Environment:
   WALLPAPER_DIR          wallpaper directory (default ~/Pictures/Wallpapers)
-  KWALL_BACKEND          "plist" (macOS 14+ default, updates every Space),
-                         "osascript" (macOS 13 and earlier), "awww" (Linux default),
-                         or "wallpaper" (active Space only)
+  KWALL_BACKEND          "auto" (default), "plist"/"macos" (macOS 14+), "osascript",
+                         "awww" (Linux), or "wallpaper" (active Space only)
   KWALL_AWWW_ARGS        extra flags for "awww img", e.g. "--resize fit --outputs DP-1"
-  KWALL_PYWAL=1          run pywal after each change (colours follow the wallpaper)
-  KWALL_PYWAL_ARGS       extra flags for wal, e.g. "-a 85 --backend colorz"
+  KWALL_COLORS=1/0       enable/disable native color extraction (default on)
+  KWALL_COLOR_MODE       "dark" (default), "light", or "auto"
+  KWALL_ALPHA            opacity percentage 0..100 (default 100)
+  KWALL_THUMB_SIZE       thumbnail longest edge in px (default 1000)
   KWALL_UNICODE_PLACEHOLDER=0   disable kitty's unicode placeholder mode in previews
 
 Post-hook: an executable ~/.config/kwall/post-hook.sh is run after each change
@@ -80,7 +83,7 @@ func run(args []string) error {
 	case "current":
 		return cmdCurrent(cfg)
 	case "cache":
-		return cmdCache(cfg)
+		return cmdCache(cfg, args[1:])
 	case "preview": // hidden: called by fzf --preview
 		if len(args) != 2 {
 			return errors.New("usage: kwall preview <rel-path>")
@@ -104,17 +107,32 @@ func listImages(cfg *config.Config) ([]string, error) {
 }
 
 func apply(cfg *config.Config, abs string) error {
-	// Hand pywal and the hook a small cached thumbnail (usually already
-	// cached by the preview), so image analysis runs fast.
-	thumb := ""
-	if pywal.Enabled() || wallpaper.HasHook(cfg) {
-		if t, _, err := preview.EnsureThumb(cfg, abs); err == nil {
-			thumb = t
-		}
+	// Overlap thumbnail generation (needed for fast color extraction and hooks)
+	// with setting the wallpaper so cold-cache runs don't pay both sequentially.
+	var thumbCh chan string
+	if cfg.Colors.Enabled || wallpaper.HasHook(cfg) {
+		thumbCh = make(chan string, 1)
+		go func() {
+			t, _, err := preview.EnsureThumb(cfg, abs)
+			if err != nil {
+				t = ""
+			}
+			thumbCh <- t
+		}()
 	}
-	if err := wallpaper.Apply(cfg, abs, thumb); err != nil {
+
+	if err := wallpaper.SetWithConfig(cfg, abs); err != nil {
+		if thumbCh != nil {
+			<-thumbCh
+		}
 		return err
 	}
+
+	thumb := ""
+	if thumbCh != nil {
+		thumb = <-thumbCh
+	}
+	wallpaper.Finish(cfg, abs, thumb)
 	fmt.Println("Wallpaper set:", abs)
 	return nil
 }
@@ -180,7 +198,18 @@ func cmdCurrent(cfg *config.Config) error {
 	return nil
 }
 
-func cmdCache(cfg *config.Config) error {
+func cmdCache(cfg *config.Config, args []string) error {
+	prune := cfg.Cache.AutoPrune
+	for _, a := range args {
+		switch a {
+		case "--prune":
+			prune = true
+		case "--no-prune":
+			prune = false
+		default:
+			return fmt.Errorf("unknown flag %q for cache (use --prune or --no-prune)", a)
+		}
+	}
 	if !preview.HasThumbnailer() {
 		return preview.ErrNoThumbnailer
 	}
@@ -191,8 +220,14 @@ func cmdCache(cfg *config.Config) error {
 	fmt.Fprintf(os.Stderr, "Caching thumbnails for %d images with %d workers...\n", len(files), cacheWorkers)
 	start := time.Now()
 	st := preview.WarmCache(cfg, files, cacheWorkers, os.Stderr)
-	fmt.Printf("Done in %s: %d created, %d already cached, %d failed\n",
-		time.Since(start).Round(time.Millisecond), st.Created, st.Cached, st.Failed)
+	pruned := 0
+	if prune {
+		if n, err := preview.PruneCache(cfg, files); err == nil {
+			pruned = n
+		}
+	}
+	fmt.Printf("Done in %s: %d created, %d already cached, %d pruned, %d failed\n",
+		time.Since(start).Round(time.Millisecond), st.Created, st.Cached, pruned, st.Failed)
 	if st.Failed > 0 {
 		return fmt.Errorf("%d thumbnails failed", st.Failed)
 	}

@@ -2,6 +2,7 @@ package wallpaper
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"net/url"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"time"
 )
+
+const macOSCmdTimeout = 10 * time.Second
 
 func fileURL(abs string) string {
 	return (&url.URL{Scheme: "file", Path: abs}).String()
@@ -80,7 +83,9 @@ function run(argv) {
 // security-scoped bookmark in ChoiceRequests.ImageFiles without requiring System
 // Events Automation permission.
 func registerAndSetActiveSpace(abs string) error {
-	out, err := exec.Command("osascript", nsworkspaceArgs(abs)...).CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), macOSCmdTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "osascript", nsworkspaceArgs(abs)...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("NSWorkspace setDesktopImageURL failed: %v: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -114,7 +119,9 @@ func indexPlistPath() (string, error) {
 }
 
 func plutilToXML(path string) ([]byte, error) {
-	cmd := exec.Command("plutil", "-convert", "xml1", "-o", "-", path)
+	ctx, cancel := context.WithTimeout(context.Background(), macOSCmdTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "plutil", "-convert", "xml1", "-o", "-", path)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -125,7 +132,9 @@ func plutilToXML(path string) ([]byte, error) {
 }
 
 func plutilToBinary(xmlData []byte, outPath string) ([]byte, error) {
-	cmd := exec.Command("plutil", "-convert", "binary1", "-o", outPath, "-")
+	ctx, cancel := context.WithTimeout(context.Background(), macOSCmdTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "plutil", "-convert", "binary1", "-o", outPath, "-")
 	cmd.Stdin = bytes.NewReader(xmlData)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -152,44 +161,69 @@ func setViaStore(abs, idxPath string) error {
 	waitForStoreWrite(idxPath, before)
 
 	u := fileURL(abs)
-	cfgXML, err := buildImageConfigXML(u)
-	if err != nil {
-		return err
-	}
-	cfgBin, err := plutilToBinary(cfgXML, "-")
+	cfgBin, err := buildImageConfigBplist(u)
 	if err != nil {
 		return err
 	}
 
-	storeXML, err := plutilToXML(idxPath)
+	rawStore, err := os.ReadFile(idxPath)
 	if err != nil {
-		return err
-	}
-	root, err := parsePlistXML(storeXML)
-	if err != nil {
-		return err
-	}
-	if _, err := updateWallpaperStore(root, u, cfgBin, time.Now()); err != nil {
-		return err
-	}
-	updatedXML, err := marshalPlistXML(root)
-	if err != nil {
-		return err
+		return fmt.Errorf("read %s: %w", idxPath, err)
 	}
 
 	tmp := fmt.Sprintf("%s.tmp-%d", idxPath, os.Getpid())
 	defer os.Remove(tmp)
-	if _, err := plutilToBinary(updatedXML, tmp); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmp, 0o644); err != nil {
-		return err
+
+	if isBplist(rawStore) {
+		root, err := parseBplist(rawStore)
+		if err != nil {
+			return err
+		}
+		if _, err := updateWallpaperStore(root, u, cfgBin, time.Now()); err != nil {
+			return err
+		}
+		f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if err != nil {
+			return err
+		}
+		writeErr := writeBplist(f, root)
+		closeErr := f.Close()
+		if writeErr != nil {
+			return writeErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+	} else {
+		storeXML, err := plutilToXML(idxPath)
+		if err != nil {
+			return err
+		}
+		root, err := parsePlistXML(storeXML)
+		if err != nil {
+			return err
+		}
+		if _, err := updateWallpaperStore(root, u, cfgBin, time.Now()); err != nil {
+			return err
+		}
+		updatedXML, err := marshalPlistXML(root)
+		if err != nil {
+			return err
+		}
+		if _, err := plutilToBinary(updatedXML, tmp); err != nil {
+			return err
+		}
+		if err := os.Chmod(tmp, 0o644); err != nil {
+			return err
+		}
 	}
 	if err := os.Rename(tmp, idxPath); err != nil {
 		return fmt.Errorf("replace %s: %w", idxPath, err)
 	}
 
-	if out, err := exec.Command("killall", "WallpaperAgent").CombinedOutput(); err != nil {
+	killCtx, killCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer killCancel()
+	if out, err := exec.CommandContext(killCtx, "killall", "WallpaperAgent").CombinedOutput(); err != nil {
 		msg := strings.TrimSpace(string(out))
 		if !strings.Contains(msg, "No matching processes") {
 			return fmt.Errorf("restart WallpaperAgent failed: %v: %s", err, msg)
@@ -228,7 +262,9 @@ func setOsascript(abs string) error {
 	if _, err := exec.LookPath("osascript"); err != nil {
 		return errors.New("osascript not found; it is only available on macOS (on Linux use KWALL_BACKEND=awww)")
 	}
-	out, err := exec.Command("osascript", osascriptArgs(abs)...).CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), macOSCmdTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "osascript", osascriptArgs(abs)...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("osascript failed: %v: %s\n(if macOS asked for permission, allow your terminal to control System Events in System Settings > Privacy & Security > Automation)",
 			err, strings.TrimSpace(string(out)))
@@ -243,7 +279,9 @@ func setWallpaperCLI(abs string) error {
 	if err != nil {
 		return errors.New("KWALL_BACKEND=wallpaper but the wallpaper CLI is not in PATH")
 	}
-	if out, err := exec.Command(bin, "set", abs).CombinedOutput(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), macOSCmdTimeout)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, bin, "set", abs).CombinedOutput(); err != nil {
 		return fmt.Errorf("wallpaper set failed: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil

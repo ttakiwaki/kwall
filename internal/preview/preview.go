@@ -3,6 +3,7 @@
 package preview
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/hex"
 	"errors"
@@ -10,15 +11,26 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"kwall/internal/config"
 )
 
-// ThumbSize is the longest edge (in pixels) of cached thumbnails.
+// DefaultThumbSize is the default longest edge (in pixels) of cached thumbnails.
+const DefaultThumbSize = 1000
+
+// ThumbSize is kept as a string alias for backwards compatibility.
 const ThumbSize = "1000"
+
+const (
+	thumbTimeout = 15 * time.Second
+	icatTimeout  = 5 * time.Second
+)
 
 var tmpCounter atomic.Uint64
 
@@ -27,38 +39,72 @@ var ErrNoThumbnailer = errors.New("no thumbnail tool found (macOS has sips built
 
 type thumbTool struct {
 	name string
-	args func(in, out string) []string
+	args func(in, out, size string) []string
 }
 
 // thumbTools are tried in order; the first one found in PATH is used. sips
 // ships with macOS; ImageMagick (v7 `magick`, v6 `convert`) and ffmpeg are the
 // usual choices on Linux.
 var thumbTools = []thumbTool{
-	{"sips", func(in, out string) []string {
-		return []string{"-s", "format", "jpeg", "-Z", ThumbSize, in, "--out", out}
+	{"sips", func(in, out, size string) []string {
+		return []string{"-s", "format", "jpeg", "-Z", size, in, "--out", out}
 	}},
-	{"magick", imageMagickArgs},
-	{"convert", imageMagickArgs},
-	{"ffmpeg", func(in, out string) []string {
+	{"magick", imageMagickArgsSize},
+	{"convert", imageMagickArgsSize},
+	{"ffmpeg", func(in, out, size string) []string {
 		return []string{"-v", "error", "-y", "-i", in,
-			"-vf", "scale=w=" + ThumbSize + ":h=" + ThumbSize + ":force_original_aspect_ratio=decrease",
+			"-vf", "scale=w=" + size + ":h=" + size + ":force_original_aspect_ratio=decrease",
 			"-frames:v", "1", "-update", "1", out}
 	}},
 }
 
-// imageMagickArgs downscales (never upscales) to ThumbSize and keeps only the
-// first frame of animated inputs.
 func imageMagickArgs(in, out string) []string {
-	return []string{in + "[0]", "-auto-orient", "-resize", ThumbSize + "x" + ThumbSize + ">", "-quality", "85", out}
+	return imageMagickArgsSize(in, out, ThumbSize)
 }
 
+// imageMagickArgsSize downscales (never upscales) to size and keeps only the
+// first frame of animated inputs.
+func imageMagickArgsSize(in, out, size string) []string {
+	return []string{in + "[0]", "-auto-orient", "-resize", size + "x" + size + ">", "-quality", "85", out}
+}
+
+var (
+	toolCacheMu   sync.Mutex
+	toolCachePATH string
+	toolCacheBin  string
+	toolCacheTool thumbTool
+	toolCacheOK   bool
+)
+
 func findThumbTool() (string, thumbTool, bool) {
+	curPATH := os.Getenv("PATH")
+	toolCacheMu.Lock()
+	if toolCachePATH == curPATH && (toolCacheOK || toolCacheBin == "__none__") {
+		bin, tool, ok := toolCacheBin, toolCacheTool, toolCacheOK
+		toolCacheMu.Unlock()
+		return bin, tool, ok
+	}
+	toolCacheMu.Unlock()
+
+	var foundBin string
+	var foundTool thumbTool
+	var found bool
 	for _, t := range thumbTools {
 		if p, err := exec.LookPath(t.name); err == nil {
-			return p, t, true
+			foundBin, foundTool, found = p, t, true
+			break
 		}
 	}
-	return "", thumbTool{}, false
+
+	toolCacheMu.Lock()
+	toolCachePATH = curPATH
+	if found {
+		toolCacheBin, toolCacheTool, toolCacheOK = foundBin, foundTool, true
+	} else {
+		toolCacheBin, toolCacheTool, toolCacheOK = "__none__", thumbTool{}, false
+	}
+	toolCacheMu.Unlock()
+	return foundBin, foundTool, found
 }
 
 // HasThumbnailer reports whether a tool for generating thumbnails exists.
@@ -72,20 +118,32 @@ func InKitty() bool {
 	return os.Getenv("KITTY_WINDOW_ID") != ""
 }
 
+func thumbSize(cfg *config.Config) int {
+	if cfg != nil && cfg.Cache.ThumbSize > 0 {
+		return cfg.Cache.ThumbSize
+	}
+	return DefaultThumbSize
+}
+
 // ThumbPath returns the cache location for abs. The name is a SHA-1 of the
-// file path and its modification time, so edited files get a fresh thumbnail.
+// file path, modification time, and non-default thumbnail size.
 func ThumbPath(cfg *config.Config, abs string) (string, error) {
 	fi, err := os.Stat(abs)
 	if err != nil {
 		return "", err
 	}
 	h := sha1.New()
-	fmt.Fprintf(h, "%s\x00%d", abs, fi.ModTime().UnixNano())
+	size := thumbSize(cfg)
+	if size == DefaultThumbSize {
+		fmt.Fprintf(h, "%s\x00%d", abs, fi.ModTime().UnixNano())
+	} else {
+		fmt.Fprintf(h, "%s\x00%d\x00%d", abs, fi.ModTime().UnixNano(), size)
+	}
 	return cfg.ThumbDir + "/" + hex.EncodeToString(h.Sum(nil)) + ".jpg", nil
 }
 
-// EnsureThumb returns the cached JPEG thumbnail for abs, generating it with
-// sips if needed. created reports whether a new thumbnail was written.
+// EnsureThumb returns the cached JPEG thumbnail for abs, generating it if
+// needed. created reports whether a new thumbnail was written.
 func EnsureThumb(cfg *config.Config, abs string) (thumb string, created bool, err error) {
 	thumb, err = ThumbPath(cfg, abs)
 	if err != nil {
@@ -107,16 +165,48 @@ func EnsureThumb(cfg *config.Config, abs string) (thumb string, created bool, er
 	// half-written thumbnail. The name keeps a .jpg extension because
 	// ImageMagick and ffmpeg pick the output format from it.
 	tmp := fmt.Sprintf("%s.tmp-%d-%d.jpg", strings.TrimSuffix(thumb, ".jpg"), os.Getpid(), tmpCounter.Add(1))
-	out, err := exec.Command(bin, tool.args(abs, tmp)...).CombinedOutput()
+	sizeStr := strconv.Itoa(thumbSize(cfg))
+	ctx, cancel := context.WithTimeout(context.Background(), thumbTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, bin, tool.args(abs, tmp, sizeStr)...).CombinedOutput()
 	if err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return "", false, fmt.Errorf("%s failed: %v: %s", tool.name, err, strings.TrimSpace(string(out)))
 	}
 	if err := os.Rename(tmp, thumb); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return "", false, err
 	}
 	return thumb, true, nil
+}
+
+// PruneCache removes cached thumbnails in cfg.ThumbDir that do not correspond
+// to any current file in files (relative paths under cfg.WallpaperDir).
+func PruneCache(cfg *config.Config, files []string) (int, error) {
+	entries, err := os.ReadDir(cfg.ThumbDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	keep := make(map[string]bool, len(files))
+	for _, rel := range files {
+		if tp, err := ThumbPath(cfg, cfg.ResolveRel(rel)); err == nil {
+			keep[filepath.Base(tp)] = true
+		}
+	}
+	removed := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".jpg") || keep[name] {
+			continue
+		}
+		if err := os.Remove(filepath.Join(cfg.ThumbDir, name)); err == nil {
+			removed++
+		}
+	}
+	return removed, nil
 }
 
 // IcatArgs builds the kitten arguments for an fzf preview pane. cols and
@@ -150,7 +240,9 @@ func Render(cfg *config.Config, rel string) error {
 	placeholder := os.Getenv("KWALL_UNICODE_PLACEHOLDER") != "0"
 	args := IcatArgs(img, os.Getenv("FZF_PREVIEW_COLUMNS"), os.Getenv("FZF_PREVIEW_LINES"), placeholder)
 
-	cmd := exec.Command("kitten", args...)
+	ctx, cancel := context.WithTimeout(context.Background(), icatTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "kitten", args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -162,7 +254,9 @@ func Show(cfg *config.Config, abs string) error {
 	if thumb, _, err := EnsureThumb(cfg, abs); err == nil {
 		img = thumb
 	}
-	cmd := exec.Command("kitten", "icat", "--stdin=no", img)
+	ctx, cancel := context.WithTimeout(context.Background(), icatTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "kitten", "icat", "--stdin=no", img)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -173,7 +267,9 @@ func Clear() {
 	if !InKitty() {
 		return
 	}
-	cmd := exec.Command("kitten", "icat", "--clear", "--stdin=no")
+	ctx, cancel := context.WithTimeout(context.Background(), icatTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "kitten", "icat", "--clear", "--stdin=no")
 	cmd.Stdout = os.Stdout
 	_ = cmd.Run()
 }

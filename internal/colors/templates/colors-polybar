@@ -1,0 +1,8 @@
+background = {alpha_hex}{background.strip}
+background-alt = {color8.strip}
+foreground = {foreground.strip}
+foreground-alt = {foreground.strip}
+primary = {color1.strip}
+secondary = {color2.strip}
+alert = {color3.strip}
+disabled = {color7.strip}

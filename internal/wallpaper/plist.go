@@ -26,6 +26,8 @@ type plistEntry struct {
 type plistNode struct {
 	kind    string
 	text    string
+	raw     []byte
+	dateVal time.Time
 	items   []*plistNode
 	entries []plistEntry
 }
@@ -224,16 +226,29 @@ func writePlistNode(buf *bytes.Buffer, n *plistNode, depth int) error {
 	return nil
 }
 
-// buildImageConfigXML builds the XML plist for the binary Configuration blob
-// embedded inside each wallpaper Choice.
-func buildImageConfigXML(fileURL string) ([]byte, error) {
-	inner := newDict(
+func buildImageConfigNode(fileURL string) *plistNode {
+	return newDict(
 		plistEntry{key: "type", val: newScalar("string", "imageFile")},
 		plistEntry{key: "url", val: newDict(
 			plistEntry{key: "relative", val: newScalar("string", fileURL)},
 		)},
 	)
-	return marshalPlistXML(inner)
+}
+
+// buildImageConfigXML builds the XML plist for the binary Configuration blob
+// embedded inside each wallpaper Choice.
+func buildImageConfigXML(fileURL string) ([]byte, error) {
+	return marshalPlistXML(buildImageConfigNode(fileURL))
+}
+
+// buildImageConfigBplist encodes the ImageConfig directly as bplist00 bytes
+// without spawning plutil.
+func buildImageConfigBplist(fileURL string) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := writeBplist(&buf, buildImageConfigNode(fileURL)); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // updateWallpaperStore rewrites every Desktop wallpaper target in an
@@ -248,7 +263,7 @@ func updateWallpaperStore(root *plistNode, fileURL string, configBytes []byte, n
 
 	updated := 0
 	updateContainer := func(container *plistNode) {
-		if desktop := container.dictGet("Desktop"); updateDesktopNode(desktop, fileURL, configB64, nowStr) {
+		if desktop := container.dictGet("Desktop"); updateDesktopNode(desktop, configBytes, configB64, now, nowStr) {
 			updated++
 		}
 	}
@@ -282,13 +297,13 @@ func updateWallpaperStore(root *plistNode, fileURL string, configBytes []byte, n
 	return updated, nil
 }
 
-func updateDesktopNode(desktop *plistNode, fileURL, configB64, nowStr string) bool {
+func updateDesktopNode(desktop *plistNode, configBytes []byte, configB64 string, now time.Time, nowStr string) bool {
 	if desktop == nil || desktop.kind != "dict" {
 		return false
 	}
 
 	choice := newDict(
-		plistEntry{key: "Configuration", val: newScalar("data", configB64)},
+		plistEntry{key: "Configuration", val: &plistNode{kind: "data", text: configB64, raw: configBytes}},
 		plistEntry{key: "Files", val: newArray()},
 		plistEntry{key: "Provider", val: newScalar("string", "com.apple.wallpaper.choice.image")},
 	)
@@ -299,7 +314,7 @@ func updateDesktopNode(desktop *plistNode, fileURL, configB64, nowStr string) bo
 	)
 
 	desktop.dictSet("Content", content)
-	desktop.dictSet("LastSet", newScalar("date", nowStr))
-	desktop.dictSet("LastUse", newScalar("date", nowStr))
+	desktop.dictSet("LastSet", &plistNode{kind: "date", text: nowStr, dateVal: now})
+	desktop.dictSet("LastUse", &plistNode{kind: "date", text: nowStr, dateVal: now})
 	return true
 }
